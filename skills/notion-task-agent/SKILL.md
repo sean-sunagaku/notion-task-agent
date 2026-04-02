@@ -19,7 +19,7 @@ Notion DB からタスクを読み取り、今日やるべき6つのタスクを
 
 ## 前提条件
 
-- Notion MCP が接続済みであること（`mcp__claude_ai_Notion__*` または `mcp__notion__*` ツール）
+- Notion MCP が接続済みであること（`mcp__Notion__*` ツール）
 - タスク管理用の Notion DB が存在すること
 
 ## DB スキーマ
@@ -33,6 +33,64 @@ Notion DB からタスクを読み取り、今日やるべき6つのタスクを
 | 優先度 | select | High / Medium / Low |
 | 種類 | select | 単発 / 定期 / 習慣 |
 | 完了 | checkbox | スマホからワンタップで完了にできる |
+
+## 朝の定期更新ワークフロー
+
+「朝のタスク更新」「モーニングルーティン」などと言われたら、以下の Phase 1〜4 を**確認なしで全件**実行する。
+
+### Phase 1: 昨日の整理
+
+全タスクを取得後、以下を処理する。
+
+**A. 完了チェック ON（完了 = `__YES__`）のタスク**
+- 種類が「単発」または「習慣」→ ステータスを `Done` に変更
+- 種類が「定期」→ `date:前回完了日:start` を今日の日付に更新 + `完了` を `__NO__` にリセット + ステータスを `Backlog` に変更
+
+**B. ステータスが `Today` または `In Progress` で、完了チェックが OFF のタスク**
+- ステータスを `Backlog` に変更
+
+### Phase 2: 曜日判定
+
+- 月〜金 → 平日モード（仕事カテゴリ優先）
+- 土・日 → 休日モード（カテゴリ優先なし）
+
+### Phase 3: 今日の6件を選ぶ（Backlog から）
+
+**平日モード:**
+1. カテゴリ「仕事」のタスクを優先順位順に最大3件
+2. 種類「定期」のタスクを全件
+3. 残り枠を共通の優先順位で補充
+
+**休日モード:**
+1. 種類「定期」のタスクを全件
+2. 残り枠を共通の優先順位で補充
+
+**共通の優先順位（残り枠）:**
+a. 期限が今日から3日以内（期限切れ含む）
+b. 期限が7日以内 かつ 優先度 High
+c. 優先度 High
+d. 優先度 Medium
+e. 優先度 Low
+※同優先度内はカテゴリが偏らないようバランスを取る。合計最大6件。
+
+### Phase 4: Notion を更新
+
+選んだ6件のステータスを `Today` に変更する。`notion-update-page` を並列実行して効率化する。
+
+完了後、以下のフォーマットでレポート出力：
+
+```
+【昨日の整理】
+✅ Done にしたタスク: N件
+🔄 リセットした定期タスク: N件
+↩️ Backlog に戻したタスク: N件
+
+【今日のタスク】（平日 or 休日モード）
+1. タスク名 — カテゴリ | 優先度 | 期限
+...
+```
+
+---
 
 ## タスク提案ロジック
 
@@ -80,33 +138,31 @@ OKなら Notion を更新します。
 ### Step 5: 承認後に Notion 更新
 
 ユーザーが OK したら、選んだタスクのステータスを Today に更新する。
-`mcp__claude_ai_Notion__notion-update-page` を使って各タスクのステータスを変更する。
+`mcp__Notion__notion-update-page` を使って各タスクのステータスを変更する。
 
 ## Notion DB の読み取り方法
 
-### 方法 A: Claude AI Notion MCP（推奨）
+`mcp__Notion__notion-search` で DB 内のページ一覧を取得し、
+`mcp__Notion__notion-fetch` で各ページのプロパティ（ステータス・完了・種類・優先度・期限など）を取得する。
 
-`mcp__claude_ai_Notion__notion-search` でタスク管理 DB を検索し、
-`mcp__claude_ai_Notion__notion-fetch` でデータを取得する。
+### 手順
 
-### 方法 B: Notion API MCP
+1. `notion-search` で `data_source_url: "collection://..."` を指定して全ページの ID 一覧を取得（`page_size: 25`）
+2. 取得した全ページを `notion-fetch` で**並列**取得してプロパティを読む
+3. ページ数が 25 件を超える場合は検索クエリを変えて複数回取得する
 
-`mcp__notion__API-post-search` で DB を検索し、
-`mcp__notion__API-query-data-source` でクエリする。
-
-フィルタ例（Backlog のタスクを取得）：
-```json
-{
-  "filter": {
-    "property": "ステータス",
-    "select": { "equals": "Backlog" }
-  },
-  "sorts": [
-    { "property": "期限", "direction": "ascending" },
-    { "property": "優先度", "direction": "ascending" }
-  ]
-}
 ```
+// 例: 全タスクを検索
+notion-search({
+  query: "タスク",
+  data_source_url: "collection://f0f2dcb0-eada-49d8-971d-78eb28c4da62",
+  page_size: 25
+})
+// → 返ってきた id を全件 notion-fetch で並列取得
+```
+
+**注意**: `notion-search` はセマンティック検索のため、クエリによって返ってくる件数が変わる。
+「タスク 完了」「ステータス Backlog」など複数クエリを使い全件取得を確認すること。
 
 ## 完了処理
 
@@ -126,7 +182,7 @@ OKなら Notion を更新します。
 Claude から更新する場合：
 1. ユーザーが「〇〇終わった」と言ったら、ページ内の該当チェックボックスを更新
    - `- [ ] サブタスク` → `- [x] サブタスク`
-   - `mcp__claude_ai_Notion__notion-update-page` の `update_content` コマンドで置換
+   - `mcp__Notion__notion-update-page` の `update_content` コマンドで置換
 2. 全サブタスクが完了したら、ユーザーに確認の上で親タスクのステータスを Done に変更
 3. 一部完了の場合はステータスを In Progress にする
 
@@ -186,7 +242,7 @@ Web検索やコードベース調査で自分で調べられるものは調べ�
 ユーザーに聞かないと分からないものは質問する。
 
 #### Step 6: Notion ページに書き込み
-`mcp__claude_ai_Notion__notion-update-page` でタスクページの内容を更新する。
+`mcp__Notion__notion-update-page` でタスクページの内容を更新する。
 既存のコンテンツがある場合は消さずに追記する。
 
 ### 分解の深さ
